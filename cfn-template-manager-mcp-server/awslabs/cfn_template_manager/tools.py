@@ -25,6 +25,64 @@ import git
 from botocore.exceptions import ClientError, WaiterError
 
 
+# CloudFormation intrinsic function constructors for YAML parsing
+def _cfn_constructor(loader, tag_suffix, node):
+    """
+    Generic constructor for CloudFormation intrinsic functions.
+    Converts YAML tags like !Ref to dictionaries like {'Ref': 'value'}.
+    """
+    if isinstance(node, yaml.ScalarNode):
+        value = loader.construct_scalar(node)
+    elif isinstance(node, yaml.SequenceNode):
+        value = loader.construct_sequence(node)
+    elif isinstance(node, yaml.MappingNode):
+        value = loader.construct_mapping(node)
+    else:
+        value = None
+    
+    # Convert tag to CloudFormation function name (e.g., !Ref -> Ref)
+    return {tag_suffix: value}
+
+
+def _setup_cfn_yaml_constructors():
+    """
+    Register CloudFormation intrinsic function constructors with PyYAML.
+    This allows parsing of CloudFormation templates with !Ref, !GetAtt, etc.
+    """
+    # List of CloudFormation intrinsic functions
+    cfn_functions = [
+        'Ref',
+        'Condition',
+        'Equals',
+        'Not',
+        'And',
+        'Or',
+        'If',
+        'FindInMap',
+        'Base64',
+        'GetAtt',
+        'GetAZs',
+        'ImportValue',
+        'Join',
+        'Select',
+        'Split',
+        'Sub',
+        'Transform',
+        'Cidr',
+    ]
+    
+    # Register multi-constructor for all CloudFormation functions
+    for func in cfn_functions:
+        yaml.SafeLoader.add_constructor(
+            f'!{func}',
+            lambda loader, node, tag=func: _cfn_constructor(loader, tag, node)
+        )
+
+
+# Initialize CloudFormation YAML constructors
+_setup_cfn_yaml_constructors()
+
+
 class TemplateRepository:
     """Manages CloudFormation template repository."""
     
@@ -141,19 +199,63 @@ class TemplateRepository:
             raise
     
     def get_template_path(self, resource_type: str) -> str:
-        """Get the path to a CloudFormation template."""
+        """
+        Get the path to a CloudFormation template.
+        
+        Searches for template files in this order:
+        1. Common naming patterns (template.yaml, cloudformation.yaml, etc.)
+        2. Any .yaml or .yml file
+        3. Any .json file
+        
+        Args:
+            resource_type: Resource type directory name
+            
+        Returns:
+            Path to the template file
+            
+        Raises:
+            ValueError: If directory or template not found
+        """
         template_dir = Path(self.local_path) / resource_type
         
         if not template_dir.exists():
             raise ValueError(f"Resource type '{resource_type}' not found")
         
-        # Look for common template file names
-        for filename in ['template.yaml', 'template.yml', 'cloudformation.yaml', 'cloudformation.yml', 'template.json']:
+        # Priority 1: Look for common template file names (preferred)
+        preferred_names = [
+            'template.yaml',
+            'template.yml', 
+            'cloudformation.yaml',
+            'cloudformation.yml',
+            'template.json',
+            'cloudformation.json'
+        ]
+        
+        for filename in preferred_names:
             template_path = template_dir / filename
             if template_path.exists():
+                logger.debug(f"Found template: {template_path}")
                 return str(template_path)
         
-        raise ValueError(f"No template file found in {template_dir}")
+        # Priority 2: Look for ANY .yaml or .yml file
+        yaml_files = list(template_dir.glob('*.yaml')) + list(template_dir.glob('*.yml'))
+        if yaml_files:
+            template_path = yaml_files[0]  # Use first found
+            logger.info(f"Using YAML file: {template_path.name}")
+            return str(template_path)
+        
+        # Priority 3: Look for ANY .json file
+        json_files = list(template_dir.glob('*.json'))
+        if json_files:
+            template_path = json_files[0]  # Use first found
+            logger.info(f"Using JSON file: {template_path.name}")
+            return str(template_path)
+        
+        # No template files found
+        raise ValueError(
+            f"No CloudFormation template found in {template_dir}. "
+            f"Expected: .yaml, .yml, or .json file"
+        )
     
     def read_template(self, resource_type: str) -> Dict[str, Any]:
         """Read and parse a CloudFormation template."""
