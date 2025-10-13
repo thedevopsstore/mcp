@@ -21,10 +21,9 @@ import asyncio
 from datetime import datetime
 from typing import Dict, Any, List, Optional
 from dotenv import load_dotenv
-from strands import Agent
+from strands import Agent, tool
 from strands.models import BedrockModel
 from strands.mcp import MCPSession
-from strands_tools import PythonTool
 from loguru import logger
 
 # Load environment variables
@@ -32,10 +31,200 @@ load_dotenv()
 
 
 # ============================================================================
-# CloudFormation Template Parser (Python Tools - No MCP Needed!)
+# CloudFormation Template Tools (using @tool decorator)
 # ============================================================================
 
-class CloudFormationParser:
+# CloudFormation YAML Constructor Setup
+def _cfn_constructor(loader, tag_suffix, node):
+    """Handle CloudFormation intrinsic functions (!Ref, !GetAtt, etc.)."""
+    if isinstance(node, yaml.ScalarNode):
+        value = loader.construct_scalar(node)
+    elif isinstance(node, yaml.SequenceNode):
+        value = loader.construct_sequence(node)
+    elif isinstance(node, yaml.MappingNode):
+        value = loader.construct_mapping(node)
+    else:
+        value = None
+    return {tag_suffix: value}
+
+
+def _setup_cfn_yaml_constructors():
+    """Register CloudFormation intrinsic function constructors."""
+    cfn_functions = [
+        'Ref', 'Condition', 'Equals', 'Not', 'And', 'Or', 'If',
+        'FindInMap', 'Base64', 'GetAtt', 'GetAZs', 'ImportValue',
+        'Join', 'Select', 'Split', 'Sub', 'Transform', 'Cidr',
+    ]
+    
+    for func in cfn_functions:
+        yaml.SafeLoader.add_constructor(
+            f'!{func}',
+            lambda loader, node, tag=func: _cfn_constructor(loader, tag, node)
+        )
+
+
+# Initialize CloudFormation YAML constructors at module load
+_setup_cfn_yaml_constructors()
+
+
+@tool
+def parse_cloudformation_template(template_content: str) -> Dict[str, Any]:
+    """
+    Parse CloudFormation template from YAML or JSON content.
+    
+    Handles CloudFormation intrinsic functions like !Ref, !GetAtt, !Sub, !Equals, etc.
+    
+    Args:
+        template_content: CloudFormation template as string (YAML or JSON)
+        
+    Returns:
+        Parsed template as dictionary with success status
+    """
+    try:
+        # Try YAML first
+        template = yaml.safe_load(template_content)
+        return {
+            "success": True,
+            "template": template,
+            "format": "yaml"
+        }
+    except yaml.YAMLError:
+        # Try JSON
+        try:
+            template = json.loads(template_content)
+            return {
+                "success": True,
+                "template": template,
+                "format": "json"
+            }
+        except json.JSONDecodeError as e:
+            return {
+                "success": False,
+                "error": f"Invalid template format: {str(e)}"
+            }
+
+
+@tool
+def extract_template_parameters(template: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Extract parameter information from parsed CloudFormation template.
+    
+    Gets parameter types, constraints, defaults, and descriptions.
+    
+    Args:
+        template: Parsed CloudFormation template dictionary
+        
+    Returns:
+        Parameter details with types, constraints, defaults, required/optional flags
+    """
+    try:
+        parameters = template.get('Parameters', {})
+        
+        param_details = {}
+        for param_name, param_config in parameters.items():
+            # Convert boolean/numeric values to strings for String type
+            allowed_values = param_config.get('AllowedValues', [])
+            default_value = param_config.get('Default')
+            
+            if param_config.get('Type') == 'String':
+                if allowed_values:
+                    allowed_values = [str(v).lower() if isinstance(v, bool) else str(v) for v in allowed_values]
+                if default_value is not None and not isinstance(default_value, str):
+                    default_value = str(default_value).lower() if isinstance(default_value, bool) else str(default_value)
+            
+            param_details[param_name] = {
+                "type": param_config.get('Type', 'String'),
+                "description": param_config.get('Description', ''),
+                "default": default_value,
+                "allowed_values": allowed_values,
+                "allowed_pattern": param_config.get('AllowedPattern'),
+                "constraint_description": param_config.get('ConstraintDescription'),
+                "min_length": param_config.get('MinLength'),
+                "max_length": param_config.get('MaxLength'),
+                "no_echo": param_config.get('NoEcho', False),
+                "required": 'Default' not in param_config
+            }
+        
+        return {
+            "success": True,
+            "parameters": param_details,
+            "required_parameters": [name for name, info in param_details.items() if info['required']],
+            "optional_parameters": [name for name, info in param_details.items() if not info['required']]
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": f"Error extracting parameters: {str(e)}"
+        }
+
+
+@tool
+def validate_template_parameters(template: Dict[str, Any], parameters: Dict[str, str]) -> Dict[str, Any]:
+    """
+    Validate parameter values against CloudFormation template constraints.
+    
+    Checks required parameters, allowed values, patterns, length constraints, etc.
+    
+    Args:
+        template: Parsed CloudFormation template dictionary
+        parameters: Parameter key-value pairs to validate
+        
+    Returns:
+        Validation result with valid/invalid status and error/warning messages
+    """
+    try:
+        # Extract template parameters
+        param_info = extract_template_parameters(template)
+        if not param_info.get('success'):
+            return param_info
+        
+        template_params = param_info['parameters']
+        required_params = param_info['required_parameters']
+        
+        errors = []
+        warnings = []
+        
+        # Check required parameters
+        for req_param in required_params:
+            if req_param not in parameters:
+                errors.append(f"Missing required parameter: {req_param}")
+        
+        # Validate parameter values
+        for param_name, param_value in parameters.items():
+            if param_name not in template_params:
+                warnings.append(f"Unknown parameter: {param_name}")
+                continue
+            
+            param_def = template_params[param_name]
+            
+            # Validate allowed values
+            if param_def.get('allowed_values') and param_value not in param_def['allowed_values']:
+                errors.append(f"Invalid value for {param_name}. Allowed: {param_def['allowed_values']}")
+            
+            # Validate string length
+            if param_def.get('min_length') and len(param_value) < param_def['min_length']:
+                errors.append(f"{param_name} must be at least {param_def['min_length']} characters")
+            
+            if param_def.get('max_length') and len(param_value) > param_def['max_length']:
+                errors.append(f"{param_name} must be at most {param_def['max_length']} characters")
+        
+        return {
+            "success": True,
+            "valid": len(errors) == 0,
+            "errors": errors,
+            "warnings": warnings
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": f"Validation error: {str(e)}"
+        }
+
+
+@tool
+def generate_stack_configuration(template_type: str, stack_name: str, 
+                                 parameters: Dict[str, str], region: str = "us-east-1",
+                                 requester: str = "agent") -> str:
     """Parse and validate CloudFormation templates."""
     
     def __init__(self):
@@ -475,16 +664,13 @@ async def create_gitops_agent(
     await github_mcp.initialize()
     logger.info("Connected to GitHub MCP at https://api.githubcopilot.com/mcp/")
     
-    # Create CloudFormation parser tools
-    cf_parser = CloudFormationParser()
-    
     # Format system prompt with configuration
     formatted_prompt = GITOPS_AGENT_PROMPT.format(
         github_org=github_org,
         github_infra_repo=github_infra_repo
     )
     
-    # Create agent
+    # Create agent with GitHub MCP and CloudFormation tools
     agent = Agent(
         name="cfn_gitops_agent",
         instructions=formatted_prompt,
@@ -494,27 +680,11 @@ async def create_gitops_agent(
         ),
         mcp_sessions=[github_mcp],
         tools=[
-            # Add Python tools for template parsing
-            PythonTool.from_function(
-                cf_parser.parse_template,
-                name="parse_cloudformation_template",
-                description="Parse CloudFormation template from YAML or JSON content"
-            ),
-            PythonTool.from_function(
-                cf_parser.get_template_parameters,
-                name="extract_template_parameters",
-                description="Extract parameter requirements from parsed CloudFormation template"
-            ),
-            PythonTool.from_function(
-                cf_parser.validate_parameters,
-                name="validate_template_parameters",
-                description="Validate parameter values against CloudFormation template constraints"
-            ),
-            PythonTool.from_function(
-                cf_parser.generate_stack_config,
-                name="generate_stack_configuration",
-                description="Generate stack configuration JSON file for GitOps deployment"
-            ),
+            # CloudFormation tools (using @tool decorator)
+            parse_cloudformation_template,
+            extract_template_parameters,
+            validate_template_parameters,
+            generate_stack_configuration,
         ],
         context={
             "github_org": github_org,
