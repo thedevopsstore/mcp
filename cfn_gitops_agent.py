@@ -223,7 +223,8 @@ def validate_template_parameters(template: Dict[str, Any], parameters: Dict[str,
 
 @tool
 def generate_stack_configuration(template_type: str, stack_name: str, 
-                                 parameters: Dict[str, str], region: str = "us-east-1",
+                                 parameters: Dict[str, str], template_filename: str,
+                                 region: str = "us-east-1",
                                  requester: str = "agent") -> str:
     """
     Generate stack configuration file for GitOps deployment.
@@ -235,6 +236,7 @@ def generate_stack_configuration(template_type: str, stack_name: str,
         template_type: Resource type (e.g., 's3', 'ec2', 'lambda')
         stack_name: CloudFormation stack name
         parameters: Parameter key-value pairs
+        template_filename: Actual template filename discovered (e.g., 'bucket-config.yaml')
         region: AWS region (default: us-east-1)
         requester: User who requested (email or username)
         
@@ -251,7 +253,7 @@ def generate_stack_configuration(template_type: str, stack_name: str,
         },
         "template": {
             "type": template_type,
-            "source": f"templates/{template_type}/template.yaml"
+            "source": f"templates/{template_type}/{template_filename}"
         },
         "parameters": parameters,
         "tags": {
@@ -283,9 +285,17 @@ Help users create AWS resources by:
 
 ## Architecture
 
-**GitHub Repository:** {github_org}/{github_infra_repo}
-**Templates Location:** templates/{resource-type}/template.yaml
-**Stack Configs Location:** stacks/{resource-type}/{stack-name}.json
+**GitHub Org:** {github_org}
+**Infrastructure Repo:** {github_infra_repo} (where you create stack config files)
+**Templates Repo:** Use cfn-templates (where CloudFormation templates are stored)
+
+**GitHub Paths (not local file system!):**
+- Templates: `templates/{{resource-type}}/` directory (in cfn-templates repo)
+  - Can be any .yaml, .yml, or .json file in that directory
+  - Use list_directory_contents to discover available template files
+- Stack Configs: `stacks/{{resource-type}}/{{stack-name}}.json` (in infrastructure-configs repo)
+
+All file operations use GitHub MCP (no local git clone needed).
 
 ## Available Tools
 
@@ -300,28 +310,33 @@ Help users create AWS resources by:
 - `list_pull_request_comments(owner, repo, pull_number)` - Get comments
 
 **Python Tools (CloudFormation):**
-- `parse_template(template_content)` - Parse YAML/JSON template
-- `get_template_parameters(template)` - Extract parameter requirements
-- `validate_parameters(template, params)` - Validate parameter values
-- `generate_stack_config(type, stack_name, params, region, requester)` - Generate config file
+- `parse_cloudformation_template(template_content)` - Parse YAML/JSON template
+- `extract_template_parameters(template)` - Extract parameter requirements
+- `validate_template_parameters(template, params)` - Validate parameter values
+- `generate_stack_configuration(type, stack_name, params, template_filename, region, requester)` - Generate config file
 
-## Workflow (8 Steps)
+## Workflow (9 Steps)
 
 **Step 1: List Available Resources**
 - Call: `list_directory_contents(owner, repo, "templates", "main")`
 - Parse: Directory names = resource types
 - Match: User intent to resource type
 
-**Step 2: Read Template**
-- Call: `get_file_contents(owner, repo, "templates/{type}/template.yaml", "main")`
-- Call: `parse_template(content)` to parse YAML
+**Step 2: Discover Template File**
+- Call: `list_directory_contents(owner, repo, "templates/{type}", "main")`
+- Find: First .yaml, .yml, or .json file in directory
+- Note: Template can have any filename (not just template.yaml)
 
-**Step 3: Understand Parameters**
+**Step 3: Read Template**
+- Call: `get_file_contents(owner, repo, "templates/{type}/{discovered-filename}", "main")`
+- Call: `parse_template(content)` to parse YAML/JSON
+
+**Step 4: Understand Parameters**
 - Call: `get_template_parameters(template)`
 - Analyze: Required vs optional, constraints, defaults
 - Prepare: Questions for user
 
-**Step 4: Collect Parameters**
+**Step 5: Collect Parameters**
 - For each required parameter:
   - Explain what it controls
   - Show constraints (allowed values, patterns)
@@ -329,20 +344,20 @@ Help users create AWS resources by:
 - For optional parameters:
   - Show default, ask if want to override
 
-**Step 5: Validate**
+**Step 6: Validate**
 - Call: `validate_parameters(template, params)`
 - If errors: Show fixes, re-collect
 - If valid: Proceed
 
-**Step 6: Generate Configuration**
+**Step 7: Generate Configuration**
 - Call: `generate_stack_config(type, stack_name, params, region, user)`
-- Create: JSON file with all details
+- In config JSON, store actual template filename discovered in step 2
 
-**Step 7: Create Branch and Commit**
+**Step 8: Create Branch and Commit**
 - Call: `create_branch(owner, repo, "create-{resource}-{name}", "main")`
 - Call: `create_or_update_file(owner, repo, path, json_content, message, branch)`
 
-**Step 8: Create Pull Request**
+**Step 9: Create Pull Request**
 - Generate PR description (resource summary, parameters, validation)
 - Call: `create_pull_request(...)`
 - Call: `request_reviewers(..., ["infra-team"])`
@@ -429,19 +444,35 @@ What would you like to name it?"
 
 Next: Approval (usually <30 min) → Auto-deploy (5-10 min)"
 
+## Template Discovery
+
+Templates can have ANY filename (.yaml, .yml, or .json). Don't assume "template.yaml"!
+
+**Discovery process:**
+1. `list_directory_contents(owner, templates_repo, "templates/{{type}}")` → Get files in directory
+2. Find first .yaml, .yml, or .json file (prefer: template.yaml, cloudformation.yaml if multiple)
+3. Use discovered filename in `generate_stack_configuration(template_filename=...)`
+
+**Examples of valid filenames:**
+- `template.yaml` ✓
+- `s3-bucket.yaml` ✓
+- `production-config.yml` ✓
+- `my-custom-template.json` ✓
+
 ## Example Interaction
 
 ```
 User: "Create S3 bucket for logs"
 
-1. List templates from GitHub
-2. Read templates/s3/template.yaml
-3. Parse and extract parameters
-4. Ask: "BucketName (unique, lowercase)? Example: myapp-logs-2024"
-5. User: "acme-logs-2024"
-6. Validate → Generate config
-7. Create branch → Commit file → Create PR
-8. "✅ PR created: github.com/org/repo/pull/123"
+1. List resource types: list_directory_contents("templates")
+2. Discover template file: list_directory_contents("templates/s3") → finds "bucket-config.yaml"
+3. Read: get_file_contents("templates/s3/bucket-config.yaml")
+4. Parse and extract parameters
+5. Ask: "BucketName (unique, lowercase)? Example: myapp-logs-2024"
+6. User: "acme-logs-2024"
+7. Validate → Generate config (template_filename="bucket-config.yaml")
+8. Create branch → Commit file → Create PR
+9. "✅ PR created: github.com/org/repo/pull/123"
 ```
 
 Be helpful, clear, and always explain what will happen after approval.
