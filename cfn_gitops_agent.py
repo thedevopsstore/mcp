@@ -23,7 +23,8 @@ from typing import Dict, Any, List, Optional
 from dotenv import load_dotenv
 from strands import Agent, tool
 from strands.models import BedrockModel
-from strands.mcp import MCPSession
+from strands.tools.mcp import MCPClient
+from mcp.client.streamable_http import streamablehttp_client
 from loguru import logger
 
 # Load environment variables
@@ -271,290 +272,261 @@ def generate_stack_configuration(template_type: str, stack_name: str,
 # ============================================================================
 
 GITOPS_AGENT_PROMPT = """
-You are a CloudFormation GitOps Agent that creates AWS infrastructure using a pull request workflow.
+You create AWS infrastructure via GitOps: read CF templates from GitHub, collect parameters, create config files, raise PRs for approval.
 
-## Your Role
+## Config
+**Org:** {github_org} | **Infra Repo:** {github_infra_repo} | **Templates Repo:** cfn-templates
+**Paths:** Templates: `templates/{{type}}/` (any .yaml/.yml/.json) | Configs: `stacks/{{type}}/{{stack}}.json`
 
-Help users create AWS resources by:
-1. Reading CloudFormation templates from GitHub repository
-2. Understanding parameter requirements
-3. Collecting parameter values from users
-4. Creating stack configuration files
-5. Raising pull requests for admin approval
-6. Tracking PR status
+## Tools
+**GitHub MCP (8):** get_file_contents • list_directory_contents • create_branch • create_or_update_file • create_pull_request • request_reviewers • get_pull_request • list_pull_request_comments
+**Python (4):** parse_cloudformation_template • extract_template_parameters • validate_template_parameters • generate_stack_configuration
 
-## Architecture
-
-**GitHub Org:** {github_org}
-**Infrastructure Repo:** {github_infra_repo} (where you create stack config files)
-**Templates Repo:** Use cfn-templates (where CloudFormation templates are stored)
-
-**GitHub Paths (not local file system!):**
-- Templates: `templates/{{resource-type}}/` directory (in cfn-templates repo)
-  - Can be any .yaml, .yml, or .json file in that directory
-  - Use list_directory_contents to discover available template files
-- Stack Configs: `stacks/{{resource-type}}/{{stack-name}}.json` (in infrastructure-configs repo)
-
-All file operations use GitHub MCP (no local git clone needed).
-
-## Available Tools
-
-**GitHub MCP Tools:**
-- `get_file_contents(owner, repo, path, ref)` - Read template files
-- `list_directory_contents(owner, repo, path, ref)` - List available templates
-- `create_branch(owner, repo, branch, from_branch)` - Create feature branch
-- `create_or_update_file(owner, repo, path, content, message, branch)` - Commit config file
-- `create_pull_request(owner, repo, title, body, head, base)` - Create PR
-- `request_reviewers(owner, repo, pull_number, reviewers)` - Tag reviewers
-- `get_pull_request(owner, repo, pull_number)` - Check PR status
-- `list_pull_request_comments(owner, repo, pull_number)` - Get comments
-
-**Python Tools (CloudFormation):**
-- `parse_cloudformation_template(template_content)` - Parse YAML/JSON template
-- `extract_template_parameters(template)` - Extract parameter requirements
-- `validate_template_parameters(template, params)` - Validate parameter values
-- `generate_stack_configuration(type, stack_name, params, template_filename, region, requester)` - Generate config file
-
-## Workflow (9 Steps)
-
-**Step 1: List Available Resources**
-- Call: `list_directory_contents(owner, repo, "templates", "main")`
-- Parse: Directory names = resource types
-- Match: User intent to resource type
-
-**Step 2: Discover Template File**
-- Call: `list_directory_contents(owner, repo, "templates/{type}", "main")`
-- Find: First .yaml, .yml, or .json file in directory
-- Note: Template can have any filename (not just template.yaml)
-
-**Step 3: Read Template**
-- Call: `get_file_contents(owner, repo, "templates/{type}/{discovered-filename}", "main")`
-- Call: `parse_template(content)` to parse YAML/JSON
-
-**Step 4: Understand Parameters**
-- Call: `get_template_parameters(template)`
-- Analyze: Required vs optional, constraints, defaults
-- Prepare: Questions for user
-
-**Step 5: Collect Parameters**
-- For each required parameter:
-  - Explain what it controls
-  - Show constraints (allowed values, patterns)
-  - Ask user for value
-- For optional parameters:
-  - Show default, ask if want to override
-
-**Step 6: Validate**
-- Call: `validate_parameters(template, params)`
-- If errors: Show fixes, re-collect
-- If valid: Proceed
-
-**Step 7: Generate Configuration**
-- Call: `generate_stack_config(type, stack_name, params, region, user)`
-- In config JSON, store actual template filename discovered in step 2
-
-**Step 8: Create Branch and Commit**
-- Call: `create_branch(owner, repo, "create-{resource}-{name}", "main")`
-- Call: `create_or_update_file(owner, repo, path, json_content, message, branch)`
-
-**Step 9: Create Pull Request**
-- Generate PR description (resource summary, parameters, validation)
-- Call: `create_pull_request(...)`
-- Call: `request_reviewers(..., ["infra-team"])`
-- Show: PR URL to user
-
-## PR Description Template
-
-Generate descriptive PRs:
-
-```
-## Resource Request: {Resource Type}
-
-**Stack:** {stack-name}
-**Template:** {template-type}
-**Region:** {region}
-**Requested By:** {user}
-
-### Parameters
-{list all parameters with values}
-
-### Resources to be Created
-{parse template Resources section, list what will be created}
-
-### Tags
-{list tags}
-
-### Validation
-✅ All required parameters provided
-✅ Parameters validated against constraints
-✅ Stack name follows naming convention
-
-### Deployment
-Upon merge, GitHub Actions will:
-1. Deploy CloudFormation stack
-2. Comment on PR with stack outputs
-3. Send notification
-
-**Approval required from:** @infra-team
-```
-
-## Safety Rules
-
-⚠️ **NEVER directly deploy** - Always create PR
-⚠️ **ALWAYS validate** - Before creating PR
-⚠️ **ALWAYS explain** - What each parameter controls
-⚠️ **Clear stack names** - Follow {app}-{resource}-{env}-stack pattern
-
-## Parameter Collection
-
-For each parameter:
-- Show type and description
-- Explain constraints in plain English
-- Provide examples
-- For AllowedValues: Show as options
-- For NoEcho: Warn it's sensitive
+## Workflow
+1. **List resources:** list_directory_contents(org, templates_repo, "templates") → [s3, ec2, ...]
+2. **Discover template:** list_directory_contents(org, templates_repo, "templates/{{type}}") → find .yaml/.yml/.json (DON'T assume template.yaml!)
+3. **Read:** get_file_contents(org, templates_repo, "templates/{{type}}/{{filename}}")
+4. **Parse:** parse_cloudformation_template(content) → get template dict
+5. **Extract params:** extract_template_parameters(template) → understand requirements
+6. **Collect:** Ask user for params (explain constraints, show examples, e.g., "BucketName (unique, lowercase, 3-63 chars)?")
+7. **Validate:** validate_template_parameters(template, params) → fix errors if any
+8. **Generate config:** generate_stack_configuration(type, stack_name, params, template_filename, region, user)
+9. **Git ops:** create_branch → create_or_update_file(path="stacks/{{type}}/{{stack}}.json") → create_pull_request → request_reviewers
 
 ## Stack Naming
+Pattern: `{{app}}-{{resource}}-{{env}}-stack` (e.g., acme-logs-prod-stack)
+Ask user to confirm generated name or provide custom.
 
-Generate meaningful names: `{app}-{resource}-{env}-stack`
-Example: `myapp-s3-prod-stack`
+## Parameter Collection
+- **Required:** Explain clearly, show constraints (AllowedValues/Pattern/Min-Max), give examples
+- **Optional:** Show default, ask if override
+- **NoEcho:** Warn "sensitive, won't be displayed"
+- **AllowedValues:** Present as options (e.g., "Environment? (dev/staging/prod)")
 
-## Error Handling
+## Template Discovery (IMPORTANT!)
+Templates can be ANY filename! Always:
+1. list_directory_contents("templates/s3") → may find "bucket-config.yaml", "s3-template.yml", etc.
+2. Pick first .yaml/.yml/.json (prefer template.yaml if multiple)
+3. Pass to generate_stack_configuration(template_filename="bucket-config.yaml")
 
-**Template not found:** List available types in templates/
-**Validation fails:** Show specific errors with fixes
-**Branch exists:** Suggest new name or use existing
-**PR creation fails:** Explain error, offer solutions
+## PR Description
+```
+## Resource Request: {{Type}}
+**Stack:** {{name}} | **Template:** {{filename}} | **Region:** {{region}} | **By:** {{user}}
+### Parameters: {{list}}
+### Resources: {{parse CF template Resources section}}
+### Validation: ✅ Params validated ✅ Stack name follows convention
+### Deployment: GitHub Actions deploys after merge (~5-10 min)
+```
 
-## User Communication
+## Safety
+⚠️ NEVER deploy directly - Always PR | ⚠️ ALWAYS validate before PR | ⚠️ Explain each parameter clearly
 
-**Starting:** "I'll help you create {resource}. Let me read the template from GitHub..."
-
-**Collecting:** "Parameter: BucketName (required)
-- Must be unique, lowercase, 3-63 chars
-- Example: mycompany-app-logs-2024
-What would you like to name it?"
-
-**Validating:** "✓ Parameters validated successfully"
-
-**Creating PR:** "✅ Pull request created!
-📋 PR: {url}
-📦 Stack: {name}
-👥 Reviewers: @infra-team
-
-Next: Approval (usually <30 min) → Auto-deploy (5-10 min)"
-
-## Template Discovery
-
-Templates can have ANY filename (.yaml, .yml, or .json). Don't assume "template.yaml"!
-
-**Discovery process:**
-1. `list_directory_contents(owner, templates_repo, "templates/{{type}}")` → Get files in directory
-2. Find first .yaml, .yml, or .json file (prefer: template.yaml, cloudformation.yaml if multiple)
-3. Use discovered filename in `generate_stack_configuration(template_filename=...)`
-
-**Examples of valid filenames:**
-- `template.yaml` ✓
-- `s3-bucket.yaml` ✓
-- `production-config.yml` ✓
-- `my-custom-template.json` ✓
-
-## Example Interaction
-
+## Example
 ```
 User: "Create S3 bucket for logs"
-
-1. List resource types: list_directory_contents("templates")
-2. Discover template file: list_directory_contents("templates/s3") → finds "bucket-config.yaml"
-3. Read: get_file_contents("templates/s3/bucket-config.yaml")
-4. Parse and extract parameters
-5. Ask: "BucketName (unique, lowercase)? Example: myapp-logs-2024"
-6. User: "acme-logs-2024"
-7. Validate → Generate config (template_filename="bucket-config.yaml")
-8. Create branch → Commit file → Create PR
-9. "✅ PR created: github.com/org/repo/pull/123"
+You: [list_directory_contents("templates") → "s3"]
+     [list_directory_contents("templates/s3") → "bucket-config.yaml"]
+     [get_file_contents("templates/s3/bucket-config.yaml")]
+     [parse → extract_params]
+     "BucketName (unique, lowercase, 3-63 chars)? Example: myapp-logs-2024"
+User: "acme-logs-2024"
+You: "Environment? (dev/staging/prod, default: dev)"
+User: "prod"
+You: "Stack name: acme-logs-prod-stack - OK?"
+User: "yes"
+You: [validate ✓] [generate_stack_config(template_filename="bucket-config.yaml")]
+     [create_branch("create-s3-acme-logs-prod")]
+     [create_or_update_file("stacks/s3/acme-logs-prod-stack.json")]
+     [create_pull_request] [request_reviewers(["infra-team"])]
+     "✅ PR created: github.com/{{org}}/{{infra_repo}}/pull/123
+     📦 Stack: acme-logs-prod-stack | 📂 File: stacks/s3/acme-logs-prod-stack.json
+     🏷️ Template: bucket-config.yaml | 👥 Reviewers: @infra-team
+     Next: Approval (~30 min) → Auto-deploy (~5-10 min)"
 ```
 
-Be helpful, clear, and always explain what will happen after approval.
+Be clear, helpful, and always explain what happens after approval.
 """
 
 
 # ============================================================================
-# Agent Creation
+# Agent Class
 # ============================================================================
 
-async def create_gitops_agent(
-    github_org: str,
-    github_infra_repo: str,
-    github_templates_repo: str,
-    github_pat: str,
-    default_reviewers: List[str] = None,
-    region: str = "us-east-1",
-    bedrock_region: str = "us-east-1"
-) -> Agent:
-    """
-    Create CloudFormation GitOps Agent.
+class CFNGitOpsAgent:
+    """CloudFormation GitOps Agent with proper context management"""
     
-    Args:
-        github_org: GitHub organization name
-        github_infra_repo: Repository for stack configs (infrastructure-configs)
-        github_templates_repo: Repository with CF templates (cfn-templates)
-        github_pat: GitHub Personal Access Token
-        default_reviewers: List of default PR reviewers
-        region: Default AWS region for stacks
-        bedrock_region: AWS region for Bedrock
+    def __init__(
+        self,
+        github_org: str,
+        github_infra_repo: str,
+        github_templates_repo: str,
+        github_pat: str,
+        default_reviewers: List[str] = None,
+        region: str = "us-east-1",
+        bedrock_region: str = "us-east-1"
+    ):
+        """
+        Initialize CFN GitOps Agent configuration.
         
-    Returns:
-        Configured GitOps Agent
-    """
-    default_reviewers = default_reviewers or ["infra-team"]
+        Args:
+            github_org: GitHub organization name
+            github_infra_repo: Repository for stack configs (infrastructure-configs)
+            github_templates_repo: Repository with CF templates (cfn-templates)
+            github_pat: GitHub Personal Access Token
+            default_reviewers: List of default PR reviewers
+            region: Default AWS region for stacks
+            bedrock_region: AWS region for Bedrock
+        """
+        self.github_org = github_org
+        self.github_infra_repo = github_infra_repo
+        self.github_templates_repo = github_templates_repo
+        self.github_pat = github_pat
+        self.default_reviewers = default_reviewers or ["infra-team"]
+        self.region = region
+        self.bedrock_region = bedrock_region
+        
+        self.mcp_client = None
+        self.agent = None
+        self._initialized = False
     
-    # Create GitHub MCP session (GitHub's hosted service)
-    github_mcp = MCPSession(
-        server_url="https://api.githubcopilot.com/mcp/",
-        transport="sse",
-        headers={
-            "Authorization": f"Bearer {github_pat}"
-        }
-    )
+    def create_mcp_client(self):
+        """Create the MCP client for GitHub's hosted service"""
+        return MCPClient(
+            lambda: streamablehttp_client(
+                "https://api.githubcopilot.com/mcp/",
+                headers={"Authorization": f"Bearer {self.github_pat}"},
+                timeout=200,
+                sse_read_timeout=200
+            )
+        )
     
-    # Initialize MCP session
-    await github_mcp.initialize()
-    logger.info("Connected to GitHub MCP at https://api.githubcopilot.com/mcp/")
+    async def initialize(self):
+        """Initialize the MCP client and agent once at startup"""
+        if self._initialized:
+            return self.agent
+        
+        try:
+            print("Initializing CloudFormation GitOps Agent...")
+            print("Connecting to GitHub MCP server...")
+            
+            self.mcp_client = self.create_mcp_client()
+            
+            # Manually enter the context manager and keep it active
+            self.mcp_client.__enter__()
+            
+            print("GitHub MCP client connected successfully.")
+            
+            # Format system prompt with configuration
+            formatted_prompt = GITOPS_AGENT_PROMPT.format(
+                github_org=self.github_org,
+                github_infra_repo=self.github_infra_repo
+            )
+            
+            # Get tools from MCP server and add CloudFormation tools
+            cf_tools = [
+                parse_cloudformation_template,
+                extract_template_parameters,
+                validate_template_parameters,
+                generate_stack_configuration,
+            ]
+            tools = self.mcp_client.list_tools_sync() + cf_tools
+            
+            # Create the CloudFormation GitOps agent
+            bedrock_model = BedrockModel(
+                model_id="us.anthropic.claude-3-7-sonnet-20250219-v1:0",
+                region=self.bedrock_region
+            )
+            
+            self.agent = Agent(
+                model=bedrock_model,
+                system_prompt=formatted_prompt,
+                tools=tools,
+                callback_handler=None
+            )
+            
+            # Store context for tools
+            self.agent.context = {
+                "github_org": self.github_org,
+                "github_infra_repo": self.github_infra_repo,
+                "github_templates_repo": self.github_templates_repo,
+                "default_reviewers": self.default_reviewers,
+                "default_region": self.region
+            }
+            
+            print("Tools registered with the agent:")
+            for tool_spec in self.agent.tool_registry.get_all_tool_specs():
+                print(f"  - {tool_spec['name']}")
+            
+            print("Agent initialization complete!")
+            self._initialized = True
+            return self.agent
+                
+        except Exception as e:
+            print(f"Error initializing MCP client: {e}")
+            raise
     
-    # Format system prompt with configuration
-    formatted_prompt = GITOPS_AGENT_PROMPT.format(
-        github_org=github_org,
-        github_infra_repo=github_infra_repo
-    )
+    async def run_conversation(self, user_input: str):
+        """Run a conversation through the agent with async streaming"""
+        if not self._initialized or self.agent is None:
+            raise RuntimeError("Agent not initialized. Call initialize() first.")
+        
+        print("Processing...")
+
+        try:
+            agent_stream = self.agent.stream_async(user_input)
+            
+            print("\nResponse:")
+            full_response = ""
+            current_tool_info = None
+            
+            async for event in agent_stream:
+                if "data" in event:
+                    text_chunk = event["data"]
+                    print(text_chunk, end="", flush=True)
+                    full_response += text_chunk
+                    
+                elif "current_tool_use" in event:
+                    tool_info = event["current_tool_use"]
+                    if tool_info != current_tool_info:
+                        current_tool_info = tool_info
+                        print(f"\nUsing tool: {tool_info.get('name', 'Unknown')}")
+                        if tool_info.get('input'):
+                            print(f"   Input: {tool_info['input']}")
+                            
+                elif "reasoning" in event and event["reasoning"]:
+                    if "reasoningText" in event:
+                        print(f"\nReasoning: {event['reasoningText']}")
+                        
+                elif "result" in event:
+                    print(f"\nTask completed")
+                    
+                elif "force_stop" in event and event["force_stop"]:
+                    reason = event.get("force_stop_reason", "Unknown reason")
+                    print(f"\nStream stopped: {reason}")
+                    break
+                    
+                elif "start" in event and event["start"]:
+                    print("Starting new processing cycle...")
+                    
+                elif "init_event_loop" in event and event["init_event_loop"]:
+                    print("Initializing event loop...")
+
+            print("\n" + "="*50)
+            return {"final_response": full_response, "stream_completed": True}
+            
+        except Exception as e:
+            print(f"Stream error: {e}")
+            raise
     
-    # Create agent with GitHub MCP and CloudFormation tools
-    agent = Agent(
-        name="cfn_gitops_agent",
-        instructions=formatted_prompt,
-        model=BedrockModel(
-            model_id="us.anthropic.claude-3-7-sonnet-20250219-v1:0",
-            region=bedrock_region
-        ),
-        mcp_sessions=[github_mcp],
-        tools=[
-            # CloudFormation tools (using @tool decorator)
-            parse_cloudformation_template,
-            extract_template_parameters,
-            validate_template_parameters,
-            generate_stack_configuration,
-        ],
-        context={
-            "github_org": github_org,
-            "github_infra_repo": github_infra_repo,
-            "github_templates_repo": github_templates_repo,
-            "default_reviewers": default_reviewers,
-            "default_region": region
-        }
-    )
-    
-    logger.info("CloudFormation GitOps Agent created successfully")
-    return agent
+    async def cleanup(self):
+        """Cleanup MCP client resources"""
+        if self.mcp_client and self._initialized:
+            try:
+                print("Cleaning up MCP client...")
+                self.mcp_client.__exit__(None, None, None)
+            except Exception as e:
+                print(f"Error during cleanup: {e}")
 
 
 # ============================================================================
@@ -562,7 +534,7 @@ async def create_gitops_agent(
 # ============================================================================
 
 async def main():
-    """Run the CloudFormation GitOps Agent."""
+    """Main interactive loop using class-based approach"""
     
     # Configuration from environment
     GITHUB_ORG = os.getenv("GITHUB_ORG", "myorg")
@@ -578,10 +550,8 @@ async def main():
         print("❌ Error: Please set GITHUB_PERSONAL_ACCESS_TOKEN")
         return
     
-    logger.info("Starting CloudFormation GitOps Agent...")
-    
-    # Create the agent
-    agent = await create_gitops_agent(
+    # Create agent manager
+    agent_manager = CFNGitOpsAgent(
         github_org=GITHUB_ORG,
         github_infra_repo=GITHUB_INFRA_REPO,
         github_templates_repo=GITHUB_TEMPLATES_REPO,
@@ -591,58 +561,53 @@ async def main():
         bedrock_region=BEDROCK_REGION
     )
     
-    # Interactive loop
-    print("\n" + "="*70)
-    print("CloudFormation GitOps Agent")
-    print("="*70)
-    print(f"\nGitHub Org: {GITHUB_ORG}")
-    print(f"Infrastructure Repo: {GITHUB_INFRA_REPO}")
-    print(f"Templates Repo: {GITHUB_TEMPLATES_REPO}")
-    print(f"Default Region: {AWS_REGION}")
-    print(f"Default Reviewers: {', '.join(DEFAULT_REVIEWERS)}")
-    print("\nI create AWS infrastructure via GitOps (Pull Requests).")
-    print("\nExamples:")
-    print("  - 'Create an S3 bucket for storing logs'")
-    print("  - 'Deploy an EC2 instance for web hosting'")
-    print("  - 'What resources can I create?'")
-    print("  - 'Check status of PR #123'")
-    print("\nType 'exit' to quit.\n")
-    
-    while True:
-        try:
-            # Get user input
-            user_input = input("\nYou: ").strip()
-            
-            if not user_input:
-                continue
-            
-            if user_input.lower() in ['exit', 'quit', 'q']:
-                print("\nGoodbye!")
+    try:
+        # Initialize the agent
+        await agent_manager.initialize()
+        
+        # Interactive loop
+        print("\n" + "="*70)
+        print("CloudFormation GitOps Agent Ready!")
+        print("="*70)
+        print(f"\nGitHub Org: {GITHUB_ORG}")
+        print(f"Infrastructure Repo: {GITHUB_INFRA_REPO}")
+        print(f"Templates Repo: {GITHUB_TEMPLATES_REPO}")
+        print(f"Default Region: {AWS_REGION}")
+        print(f"Default Reviewers: {', '.join(DEFAULT_REVIEWERS)}")
+        print("\nI create AWS infrastructure via GitOps (Pull Requests).")
+        print("\nExamples:")
+        print("  - 'Create an S3 bucket for storing logs'")
+        print("  - 'Deploy an EC2 instance for web hosting'")
+        print("  - 'What resources can I create?'")
+        print("  - 'Check status of PR #123'")
+        print("\nType 'quit' to exit.\n")
+        
+        while True:
+            try:
+                user_input = input("You > ").strip()
+                
+                if user_input.lower() in ["quit", "exit", "q"]:
+                    print("Goodbye!")
+                    break
+                    
+                if not user_input:
+                    continue
+                    
+                await agent_manager.run_conversation(user_input)
+                
+            except KeyboardInterrupt:
+                print("\nOperation cancelled by user.")
                 break
-            
-            # Run agent
-            print("\nAgent: ", end="", flush=True)
-            
-            response = await agent.run(
-                prompt=user_input,
-                stream=True
-            )
-            
-            # Stream response
-            async for chunk in response:
-                if chunk.get("type") == "text":
-                    print(chunk.get("content", ""), end="", flush=True)
-            
-            print()  # New line after streaming
-            
-        except KeyboardInterrupt:
-            print("\n\nGoodbye!")
-            break
-        except Exception as e:
-            logger.error(f"Error: {str(e)}")
-            print(f"\nError: {str(e)}")
-            print("Please try again or type 'exit' to quit.")
+            except Exception as e:
+                print(f"\nError: {e}")
+                
+    except Exception as e:
+        print(f"Failed to initialize agent: {e}")
+    finally:
+        # Cleanup when done
+        await agent_manager.cleanup()
 
 
 if __name__ == "__main__":
     asyncio.run(main())
+
