@@ -233,6 +233,10 @@ def generate_stack_configuration(template_type: str, stack_name: str,
     Creates a JSON configuration file with stack metadata, parameters, and tags
     that GitHub Actions will use to deploy the CloudFormation stack.
     
+    NOTE: This format is NOT directly usable with AWS CLI commands. It's a custom
+    GitOps format that GitHub Actions parses. For AWS CLI compatibility, use
+    generate_aws_cli_parameters() instead.
+    
     Args:
         template_type: Resource type (e.g., 's3', 'ec2', 'lambda')
         stack_name: CloudFormation stack name
@@ -242,7 +246,7 @@ def generate_stack_configuration(template_type: str, stack_name: str,
         requester: User who requested (email or username)
         
     Returns:
-        JSON string of complete stack configuration
+        JSON string of complete stack configuration (GitOps format)
     """
     config = {
         "request": {
@@ -267,6 +271,36 @@ def generate_stack_configuration(template_type: str, stack_name: str,
     return json.dumps(config, indent=2)
 
 
+@tool
+def generate_aws_cli_parameters(parameters: Dict[str, str]) -> str:
+    """
+    Generate AWS CLI-compatible parameter file for CloudFormation commands.
+    
+    Creates a JSON parameter file in the format required by AWS CloudFormation CLI
+    commands like create-stack, update-stack, and deploy.
+    
+    Format: Array of objects with ParameterKey and ParameterValue fields.
+    
+    Usage with AWS CLI:
+        aws cloudformation create-stack \\
+            --stack-name my-stack \\
+            --template-body file://template.yaml \\
+            --parameters file://parameters.json
+    
+    Args:
+        parameters: Parameter key-value pairs (e.g., {"BucketName": "my-bucket", "Environment": "prod"})
+        
+    Returns:
+        JSON string in AWS CLI parameter file format
+    """
+    param_list = [
+        {"ParameterKey": key, "ParameterValue": str(value)}
+        for key, value in parameters.items()
+    ]
+    
+    return json.dumps(param_list, indent=2)
+
+
 # ============================================================================
 # Agent System Prompt
 # ============================================================================
@@ -275,12 +309,12 @@ GITOPS_AGENT_PROMPT = """
 You create AWS infrastructure via GitOps: read CF templates from GitHub, collect parameters, create config files, raise PRs for approval.
 
 ## Config
-**Org:** {github_org} | **Infra Repo:** {github_infra_repo} | **Templates Repo:** cfn-templates
+**Org:** {github_org} | **Infra Repo:** {github_infra_repo} | **Templates Repo:** {github_templates_repo}
 **Paths:** Templates: `templates/{{type}}/` (any .yaml/.yml/.json) | Configs: `stacks/{{type}}/{{stack}}.json`
 
 ## Tools
 **GitHub MCP (8):** get_file_contents • list_directory_contents • create_branch • create_or_update_file • create_pull_request • request_reviewers • get_pull_request • list_pull_request_comments
-**Python (4):** parse_cloudformation_template • extract_template_parameters • validate_template_parameters • generate_stack_configuration
+**Python (5):** parse_cloudformation_template • extract_template_parameters • validate_template_parameters • generate_stack_configuration • generate_aws_cli_parameters
 
 ## Workflow
 1. **List resources:** list_directory_contents(org, templates_repo, "templates") → [s3, ec2, ...]
@@ -290,8 +324,13 @@ You create AWS infrastructure via GitOps: read CF templates from GitHub, collect
 5. **Extract params:** extract_template_parameters(template) → understand requirements
 6. **Collect:** Ask user for params (explain constraints, show examples, e.g., "BucketName (unique, lowercase, 3-63 chars)?")
 7. **Validate:** validate_template_parameters(template, params) → fix errors if any
-8. **Generate config:** generate_stack_configuration(type, stack_name, params, template_filename, region, user)
-9. **Git ops:** create_branch → create_or_update_file(path="stacks/{{type}}/{{stack}}.json") → create_pull_request → request_reviewers
+8. **Generate parameter file:** generate_aws_cli_parameters(params) → AWS CLI-compatible JSON format
+9. **Git ops:** create_branch → create_or_update_file(path="stacks/{{type}}/{{stack}}.json", content=aws_cli_params_json) → create_pull_request → request_reviewers
+
+## Parameter File Format
+**IMPORTANT:** The file created in the PR must use `generate_aws_cli_parameters()` output (AWS CLI-compatible format).
+- Use `generate_aws_cli_parameters(params)` for the actual file content in the PR
+- `generate_stack_configuration()` can be used for planning/metadata during conversation, but NOT for the PR file
 
 ## Stack Naming
 Pattern: `{{app}}-{{resource}}-{{env}}-stack` (e.g., acme-logs-prod-stack)
@@ -335,13 +374,14 @@ You: "Environment? (dev/staging/prod, default: dev)"
 User: "prod"
 You: "Stack name: acme-logs-prod-stack - OK?"
 User: "yes"
-You: [validate ✓] [generate_stack_config(template_filename="bucket-config.yaml")]
+You: [validate ✓] [generate_aws_cli_parameters(params={"BucketName": "acme-logs-2024", "Environment": "prod"})]
      [create_branch("create-s3-acme-logs-prod")]
-     [create_or_update_file("stacks/s3/acme-logs-prod-stack.json")]
+     [create_or_update_file("stacks/s3/acme-logs-prod-stack.json", content=aws_cli_params_json)]
      [create_pull_request] [request_reviewers(["infra-team"])]
      "✅ PR created: github.com/{{org}}/{{infra_repo}}/pull/123
      📦 Stack: acme-logs-prod-stack | 📂 File: stacks/s3/acme-logs-prod-stack.json
      🏷️ Template: bucket-config.yaml | 👥 Reviewers: @infra-team
+     📄 Format: AWS CLI-compatible parameters (usable with aws cloudformation create-stack --parameters file://...)
      Next: Approval (~30 min) → Auto-deploy (~5-10 min)"
 ```
 
@@ -420,7 +460,8 @@ class CFNGitOpsAgent:
             # Format system prompt with configuration
             formatted_prompt = GITOPS_AGENT_PROMPT.format(
                 github_org=self.github_org,
-                github_infra_repo=self.github_infra_repo
+                github_infra_repo=self.github_infra_repo,
+                github_templates_repo=self.github_templates_repo
             )
             
             # Get tools from MCP server and add CloudFormation tools
@@ -429,6 +470,7 @@ class CFNGitOpsAgent:
                 extract_template_parameters,
                 validate_template_parameters,
                 generate_stack_configuration,
+                generate_aws_cli_parameters,
             ]
             tools = self.mcp_client.list_tools_sync() + cf_tools
             
@@ -444,15 +486,6 @@ class CFNGitOpsAgent:
                 tools=tools,
                 callback_handler=None
             )
-            
-            # Store context for tools
-            self.agent.context = {
-                "github_org": self.github_org,
-                "github_infra_repo": self.github_infra_repo,
-                "github_templates_repo": self.github_templates_repo,
-                "default_reviewers": self.default_reviewers,
-                "default_region": self.region
-            }
             
             print("Tools registered with the agent:")
             for tool_spec in self.agent.tool_registry.get_all_tool_specs():
