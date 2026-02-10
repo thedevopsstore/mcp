@@ -6,6 +6,7 @@ Provides tools to interact with repositories, attributes, and values.
 import os
 import httpx
 from fastmcp import FastMCP
+from fastmcp.server.dependencies import get_http_headers
 
 # Initialize FastMCP server
 mcp = FastMCP(name="MDM Product Server")
@@ -21,6 +22,11 @@ async def _make_request(endpoint: str, params: dict | None = None) -> dict:
     """
     Helper function to make HTTP GET requests to the MDM API.
     
+    Gets the authentication token from:
+    1. Request header 'X-MDM-Token' (if provided by client)
+    2. Request Cookie header 'epimresttoken' (if provided by client)
+    3. Environment variable MDM_TOKEN (fallback)
+    
     Args:
         endpoint: The API endpoint path (e.g., '/webcm/rest/api/repositories')
         params: Optional query parameters as a dictionary
@@ -30,14 +36,39 @@ async def _make_request(endpoint: str, params: dict | None = None) -> dict:
         
     Raises:
         httpx.HTTPError: If the request fails
-        ValueError: If MDM_TOKEN environment variable is not set
+        ValueError: If no token is available from any source
     """
-    if not MDM_TOKEN:
-        raise ValueError("MDM_TOKEN environment variable is not set. Please set it with your authentication token.")
+    # Try to get token from request headers first
+    request_headers = get_http_headers()
+    token = None
+    
+    # Check for X-MDM-Token header
+    if "x-mdm-token" in request_headers:
+        token = request_headers["x-mdm-token"]
+    # Check for Cookie header with epimresttoken
+    elif "cookie" in request_headers:
+        cookie_header = request_headers["cookie"]
+        # Parse cookie to find epimresttoken
+        for cookie in cookie_header.split(";"):
+            cookie = cookie.strip()
+            if cookie.startswith("epimresttoken="):
+                token = cookie.split("=", 1)[1]
+                break
+    
+    # Fall back to environment variable if no header token found
+    if not token:
+        token = MDM_TOKEN
+    
+    if not token:
+        raise ValueError(
+            "No authentication token found. "
+            "Provide token via 'X-MDM-Token' header, 'Cookie: epimresttoken=<token>' header, "
+            "or set MDM_TOKEN environment variable."
+        )
     
     url = f"{MDM_BASE_URL.rstrip('/')}/{endpoint.lstrip('/')}"
     headers = {
-        "Cookie": f"epimresttoken={MDM_TOKEN}"
+        "Cookie": f"epimresttoken={token}"
     }
     
     async with httpx.AsyncClient(timeout=30.0) as client:

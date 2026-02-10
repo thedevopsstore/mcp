@@ -100,11 +100,25 @@ The server will be available at `http://localhost:8000/mcp` (or your configured 
 
 ## Authentication
 
-The server uses the `MDM_TOKEN` environment variable for authentication. You must:
+The server supports multiple ways to provide the authentication token (in order of priority):
 
-1. Generate a token yourself (e.g., using Postman to POST to `/enable-api/login?login={user}&password={password}`)
-2. Set the token as the `MDM_TOKEN` environment variable
-3. All API requests will automatically include the token in the `Cookie: epimresttoken={token}` header
+1. **Request Header `X-MDM-Token`** (recommended for testing with Inspector)
+   - Pass the token as a custom header: `X-MDM-Token: <your-token>`
+   - Works when testing with MCP Inspector or any HTTP client
+
+2. **Cookie Header `epimresttoken`**
+   - Pass as: `Cookie: epimresttoken=<your-token>`
+   - Useful if your client already uses cookie-based auth
+
+3. **Environment Variable `MDM_TOKEN`** (fallback)
+   - Set: `export MDM_TOKEN="your-token-here"`
+   - Useful for server-side configuration
+
+**To generate a token:**
+- Use Postman to POST to `/enable-api/login?login={user}&password={password}`
+- Or use curl: `curl -X POST "http://35.91.235.135/enable-api/login?login=user&password=pass"`
+
+**All API requests will automatically include the token in the `Cookie: epimresttoken={token}` header when calling the MDM API.**
 
 ## API Endpoints
 
@@ -120,33 +134,54 @@ The server interacts with the following MDM API endpoints:
 
 ### For HTTP/Streamable HTTP Transport
 
-Since the server runs as an HTTP service, clients can connect directly via URL:
+Since the server runs as an HTTP service, clients can connect directly via URL and pass the token in headers:
 
+**Option 1: Using X-MDM-Token header (recommended):**
 ```json
 {
   "mcpServers": {
     "mdm-server": {
       "url": "http://localhost:8000/mcp",
       "headers": {
-        "Authorization": "Bearer optional-client-token"
+        "X-MDM-Token": "your-mdm-token-here"
       }
     }
   }
 }
 ```
 
-Or if using FastMCP client library:
+**Option 2: Using Cookie header:**
+```json
+{
+  "mcpServers": {
+    "mdm-server": {
+      "url": "http://localhost:8000/mcp",
+      "headers": {
+        "Cookie": "epimresttoken=your-mdm-token-here"
+      }
+    }
+  }
+}
+```
 
+**Using FastMCP client library:**
 ```python
 from fastmcp import Client
 from fastmcp.client.transports import StreamableHttpTransport
 
 transport = StreamableHttpTransport(
     url="http://localhost:8000/mcp",
-    headers={"Authorization": "Bearer optional-token"}
+    headers={
+        "X-MDM-Token": "your-mdm-token-here"
+    }
 )
 client = Client(transport)
 ```
+
+**Testing with MCP Inspector:**
+When using the MCP Inspector, you can configure headers in the connection settings. Add:
+- Header name: `X-MDM-Token`
+- Header value: `your-token-here`
 
 ### For STDIO Transport (Alternative)
 
