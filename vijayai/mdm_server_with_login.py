@@ -7,7 +7,7 @@ Server is stateless - checks for cookies on each request.
 import os
 import httpx
 from fastmcp import FastMCP, Context
-from fastmcp.server.dependencies import get_http_headers
+from fastmcp.server.dependencies import get_http_headers, get_context
 
 # Initialize FastMCP server
 mcp = FastMCP(name="MDM Server with Auto-Login")
@@ -48,17 +48,26 @@ async def _perform_login(ctx: Context, username: str, password: str) -> dict:
         response.raise_for_status()
         
         # Extract cookies from the response
+        # httpx automatically stores cookies in response.cookies
         cookies_dict = {}
         for cookie in response.cookies.jar:
             cookies_dict[cookie.name] = cookie.value
         
-        # Also check Set-Cookie headers
-        set_cookie_headers = response.headers.get_list("Set-Cookie")
-        for cookie_header in set_cookie_headers:
-            cookie_parts = cookie_header.split(";")[0].strip()
-            if "=" in cookie_parts:
-                name, value = cookie_parts.split("=", 1)
-                cookies_dict[name.strip()] = value.strip()
+        # If cookies not in jar, check response body (some APIs return tokens in JSON)
+        if not cookies_dict:
+            try:
+                response_data = response.json()
+                # Check if tokens are in response body
+                if "epimresttoken" in response_data:
+                    cookies_dict["epimresttoken"] = response_data["epimresttoken"]
+                if "ewtoken" in response_data:
+                    cookies_dict["ewtoken"] = response_data["ewtoken"]
+                # Also check for common token field names
+                if "token" in response_data and not cookies_dict:
+                    # If single token field, might need to split or use as-is
+                    cookies_dict["epimresttoken"] = response_data.get("token", "")
+            except (ValueError, KeyError):
+                pass  # Not JSON or no token fields
         
         # Verify both required cookies are present
         required_cookies = ["epimresttoken", "ewtoken"]
@@ -67,11 +76,38 @@ async def _perform_login(ctx: Context, username: str, password: str) -> dict:
         if missing_cookies:
             raise ValueError(
                 f"Login successful but required cookies missing: {missing_cookies}. "
-                f"Received cookies: {list(cookies_dict.keys())}"
+                f"Received cookies: {list(cookies_dict.keys())}. "
+                f"Response status: {response.status_code}. "
+                f"Response headers: {dict(response.headers)}"
             )
         
         # Store cookies in session state
-        await ctx.set_state("api_cookies", cookies_dict)
+        # Ensure we have a valid context
+        if ctx is None:
+            # Try to get context from current execution context
+            try:
+                ctx = get_context()
+            except RuntimeError:
+                raise ValueError(
+                    "Context not available - cannot store cookies. "
+                    "This function must be called from within a tool or resource handler."
+                )
+        
+        # Store cookies - set_state should be async
+        if not hasattr(ctx, 'set_state'):
+            raise ValueError("Context does not have set_state method")
+        
+        # Call set_state - it should be async and return a coroutine
+        try:
+            # Try awaiting directly (standard async method)
+            await ctx.set_state("api_cookies", cookies_dict)
+        except TypeError as e:
+            # If set_state returns None (synchronous), handle it
+            if "object NoneType can't be used in 'await' expression" in str(e):
+                # Try calling without await (synchronous version)
+                ctx.set_state("api_cookies", cookies_dict)
+            else:
+                raise
         
         return cookies_dict
 
